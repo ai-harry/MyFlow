@@ -84,6 +84,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settings.mainWindowVisible = false
         settings.settingsWindowVisible = false
         settings.applyDockIcon()   // .accessory unless alwaysShowDockIcon
+        settings.syncLoginItem()
         installWindowTracking()
         _ = Store.shared
         _ = Engine.shared

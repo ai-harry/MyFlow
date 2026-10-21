@@ -62,7 +62,7 @@ final class AppSettings: ObservableObject {
         set { alwaysShowDockIcon = newValue }
     }
     @AppStorage("soundsEnabled") var soundsEnabled = true
-    @AppStorage("launchAtLogin") var launchAtLogin = false
+    @AppStorage("launchAtLogin") var launchAtLogin = true
     @AppStorage("transformHotkeysEnabled") var transformHotkeysEnabled = true
     @AppStorage("activeStyleID") var activeStyleID = 0
     @AppStorage("maxSeconds") var maxSeconds = 180
@@ -137,8 +137,20 @@ final class AppSettings: ObservableObject {
             if launchAtLogin { try SMAppService.mainApp.register() }
             else { try SMAppService.mainApp.unregister() }
         } catch {
-            NSLog("login item error: \(error)")
+            mflog("login item error: \(error)")
         }
+    }
+
+    /// Called at launch: registers the login item when the setting is on but
+    /// macOS doesn't have it yet (first run, or the app was reinstalled).
+    /// If the user switched it off in System Settings → Login Items, macOS
+    /// reports .requiresApproval and we leave that choice alone.
+    func syncLoginItem() {
+        let status = SMAppService.mainApp.status
+        if launchAtLogin, status == .notRegistered || status == .notFound {
+            applyLoginItem()
+        }
+        mflog("login item: \(launchAtLogin ? "on" : "off"), status \(SMAppService.mainApp.status.rawValue)")
     }
 
     func applyDockIcon() {

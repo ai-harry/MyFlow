@@ -469,7 +469,7 @@ Open Settings with `Cmd` + `,` or from the menu bar. Preferences are saved autom
 
 | Setting | What it does | Default |
 | --- | --- | --- |
-| Launch at login | Starts My Flow when you log in (main window stays closed). | Off |
+| Launch at login | Starts My Flow when you log in (main window stays closed). On by default; My Flow registers itself on first launch. Turning it off here, or in *System Settings → General → Login Items*, is respected. | On |
 | Always show in Dock | Keeps a Dock icon even when no window is open. | Off |
 | Show Flow Bar | Shows or hides the floating bar. | On |
 | Flow Bar appearance | Follow system, Dark, or Light. | Follow system |
@@ -626,7 +626,7 @@ rm -rf "$HOME/Library/Application Support/FluidAudio"
 defaults delete com.harry.myflow
 ```
 
-If you turned on "Launch at login", turn it off first in Settings → General, or remove My Flow from *System Settings → General → Login Items*. You can also remove My Flow from the Accessibility, Microphone and Screen Recording lists, or run `tccutil reset All com.harry.myflow`. Remove the `MyFlow Dev Signing` certificate in Keychain Access if you created one. Note that `FluidAudio/Models` may be shared with other apps that use FluidAudio, so skip that step if you also use such apps.
+"Launch at login" is on by default, so turn it off first in Settings → General, or remove My Flow from *System Settings → General → Login Items*. You can also remove My Flow from the Accessibility, Microphone and Screen Recording lists, or run `tccutil reset All com.harry.myflow`. Remove the `MyFlow Dev Signing` certificate in Keychain Access if you created one. Note that `FluidAudio/Models` may be shared with other apps that use FluidAudio, so skip that step if you also use such apps.
 
 ---
 
