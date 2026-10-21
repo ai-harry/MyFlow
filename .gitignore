@@ -1,0 +1,16 @@
+# SwiftPM build output
+.build/
+.swiftpm/
+*.xcodeproj/
+xcuserdata/
+DerivedData/
+
+# macOS
+.DS_Store
+
+# Secrets and local data (never commit)
+.env
+*.env
+*.db
+*.wav
+debug.log
