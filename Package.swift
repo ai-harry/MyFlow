@@ -8,9 +8,10 @@ let package = Package(
         .package(url: "https://github.com/FluidInference/FluidAudio.git", exact: "0.17.7")
     ],
     targets: [
+        .target(name: "ObjCTry", path: "Sources/ObjCTry"),
         .executableTarget(
             name: "MyFlow",
-            dependencies: [.product(name: "FluidAudio", package: "FluidAudio")],
+            dependencies: ["ObjCTry", .product(name: "FluidAudio", package: "FluidAudio")],
             path: "Sources/MyFlow",
             swiftSettings: [.swiftLanguageMode(.v5)]
         )

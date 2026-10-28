@@ -89,6 +89,10 @@ private struct DictationSettingsTab: View {
                         AudioDevices.setDefaultInput(selectedDevice)
                     }
                 }
+                Toggle("Use Mac microphone with AirPods / Bluetooth", isOn: settings.$preferBuiltInMic)
+                    .onChange(of: settings.preferBuiltInMic) { Engine.shared.rearmMic() }
+                Text("Off: AirPods mic is used, so you can talk away from the Mac. On: Mac mic is used, which avoids the ~1 s Bluetooth switch delay.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Picker("Language", selection: settings.$language) {
                     ForEach(languages.sorted(by: { $0.value < $1.value }), id: \.key) { k, v in
                         Text(v).tag(k)

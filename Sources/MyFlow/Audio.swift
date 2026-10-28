@@ -1,6 +1,8 @@
 import Foundation
 import AVFoundation
 import CoreAudio
+import AudioToolbox
+import ObjCTry
 
 enum MicError: LocalizedError {
     case permissionDenied
@@ -55,9 +57,11 @@ final class AudioRecorder {
             self.inFormat = inFormat; self.deviceID = deviceID
         }
         func dispose() {
-            engine.inputNode.removeTap(onBus: 0)
-            if engine.isRunning { engine.stop() }
-            engine.reset()
+            try? AudioRecorder.objc("dispose") {
+                engine.inputNode.removeTap(onBus: 0)
+                if engine.isRunning { engine.stop() }
+                engine.reset()
+            }
         }
     }
 
@@ -74,6 +78,8 @@ final class AudioRecorder {
     private(set) var restarts = 0
     private var lastRestartAt = Date.distantPast
     private var lastRearmAt = Date.distantPast
+    private var lastConfigChangeAt = Date.distantPast
+    private var armRetries = 0
     private var deviceListenerInstalled = false
     private static let armQueue = DispatchQueue(label: "myflow.mic.arm", qos: .userInitiated)
 
@@ -131,8 +137,22 @@ final class AudioRecorder {
         armLock.unlock()
 
         let t0 = DispatchTime.now().uptimeNanoseconds
-        guard let built = try? buildGraph() else { return }
-        built.engine.prepare()          // allocates buffers; does NOT open the mic
+        let built: Armed
+        do {
+            built = try buildGraph()
+            // allocates buffers; does NOT open the mic
+            try Self.objc("prepare") { built.engine.prepare() }
+        } catch {
+            // Usually a Bluetooth device mid-switch. Never crash; try again
+            // once the route has settled so the next keypress is still fast.
+            armRetries += 1
+            mflog("mic arm failed (\(error.localizedDescription)) — retry #\(armRetries)")
+            if armRetries <= 4 {
+                Self.armQueue.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.arm() }
+            }
+            return
+        }
+        armRetries = 0
         let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000
         mflog(String(format: "mic armed in %.0f ms (device %u)", ms, built.deviceID))
 
@@ -149,7 +169,7 @@ final class AudioRecorder {
         armLock.lock(); defer { armLock.unlock() }
         guard let a = armed else { return nil }
         armed = nil
-        let current = Self.defaultInputDeviceID()
+        let current = AudioDevices.captureInputID()
         guard current != 0, current == a.deviceID else {
             mflog("armed mic was for device \(a.deviceID), now \(current) — discarding")
             a.dispose()
@@ -191,8 +211,13 @@ final class AudioRecorder {
             forName: .AVAudioEngineConfigurationChange, object: nil, queue: .main
         ) { [weak self] _ in
             guard let self else { return }
+            self.lastConfigChangeAt = Date()
             if self.isRecording {
-                self.restartCapture(reason: "input configuration changed")
+                // Let the route settle before rebuilding; rebuilding mid-switch
+                // reads a stale format and the engine just stops again.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                    self.restartCapture(reason: "input configuration changed")
+                }
             } else {
                 guard Date().timeIntervalSince(self.lastRearmAt) > 0.4 else { return }
                 self.lastRearmAt = Date()
@@ -202,57 +227,88 @@ final class AudioRecorder {
         }
     }
 
-    private static func defaultInputDeviceID() -> AudioDeviceID {
-        var id = AudioDeviceID(0)
-        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
-        var addr = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDefaultInputDevice,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
-        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
-                                         &addr, 0, nil, &size, &id) == noErr else { return 0 }
-        return id
-    }
-
     /// The expensive part: query the input format, build the converter, install
     /// the tap. ~110 ms. Runs off the main thread when arming.
     private func buildGraph() throws -> Armed {
         guard AVCaptureDevice.default(for: .audio) != nil else { throw MicError.noInputDevice }
+        let deviceID = AudioDevices.captureInputID()
         let engine = AVAudioEngine()
         let input = engine.inputNode
+        if deviceID != 0, deviceID != AudioDevices.defaultInputID(), let unit = input.audioUnit {
+            var dev = deviceID
+            let st = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
+                                          kAudioUnitScope_Global, 0, &dev,
+                                          UInt32(MemoryLayout<AudioDeviceID>.size))
+            if st != noErr { mflog("could not select input device \(deviceID): \(st)") }
+        }
         let inFormat = input.outputFormat(forBus: 0)
         guard inFormat.sampleRate > 0, inFormat.channelCount > 0 else {
             mflog("mic input format invalid (\(inFormat.sampleRate)Hz, \(inFormat.channelCount)ch)")
             throw MicError.noInputDevice
         }
-        guard let conv = AVAudioConverter(from: inFormat, to: Self.targetFormat) else {
+        let firstConv = try installCaptureTap(on: input, format: inFormat)
+        return Armed(engine: engine, converter: firstConv, inFormat: inFormat,
+                     deviceID: deviceID)
+    }
+
+    /// Installs the capture tap and returns the converter for `inFormat`. The
+    /// tap rebuilds its converter if the hardware format changes under it.
+    private func installCaptureTap(on input: AVAudioInputNode,
+                                   format inFormat: AVAudioFormat) throws -> AVAudioConverter {
+        guard let firstConv = AVAudioConverter(from: inFormat, to: Self.targetFormat) else {
             mflog("AVAudioConverter nil for \(inFormat)")
             throw MicError.formatUnavailable
         }
-        input.installTap(onBus: 0, bufferSize: 2048, format: inFormat) { [weak self] buffer, _ in
-            guard let self, self.isRecording else { return }
-            if let ch = buffer.floatChannelData?[0] {
-                let n = Int(buffer.frameLength)
-                var sum: Float = 0
-                for i in 0..<n { sum += ch[i] * ch[i] }
-                let rms = sqrt(sum / Float(max(n, 1)))
-                self.onLevel?(min(1.0, sqrt(rms) * 2.2))
-            }
-            let ratio = Self.targetFormat.sampleRate / buffer.format.sampleRate
-            let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio + 16)
-            guard let out = AVAudioPCMBuffer(pcmFormat: Self.targetFormat, frameCapacity: capacity) else { return }
-            var fed = false
-            conv.convert(to: out, error: nil) { _, status in
-                if fed { status.pointee = .noDataNow; return nil }
-                fed = true; status.pointee = .haveData; return buffer
-            }
-            if out.frameLength > 0, let ch = out.int16ChannelData?[0] {
-                let bytes = Data(bytes: ch, count: Int(out.frameLength) * 2)
-                self.lock.lock(); self.pcm.append(bytes); self.lock.unlock()
+        // The tap block runs serially on one audio thread, so this is safe.
+        var conv = firstConv
+        // format: nil = whatever the hardware delivers. Passing an explicit
+        // format raises an NSException (uncatchable in Swift -> crash) when a
+        // Bluetooth device switches rate between the query and this call.
+        try Self.objc("installTap") {
+            input.installTap(onBus: 0, bufferSize: 2048, format: nil) { [weak self] buffer, _ in
+                guard let self, self.isRecording else { return }
+                if buffer.format != conv.inputFormat {
+                    guard let c = AVAudioConverter(from: buffer.format, to: Self.targetFormat) else { return }
+                    conv = c
+                }
+                if let ch = buffer.floatChannelData?[0] {
+                    let n = Int(buffer.frameLength)
+                    var sum: Float = 0
+                    for i in 0..<n { sum += ch[i] * ch[i] }
+                    let rms = sqrt(sum / Float(max(n, 1)))
+                    self.onLevel?(min(1.0, sqrt(rms) * 2.2))
+                }
+                let ratio = Self.targetFormat.sampleRate / buffer.format.sampleRate
+                let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio + 16)
+                guard let out = AVAudioPCMBuffer(pcmFormat: Self.targetFormat, frameCapacity: capacity) else { return }
+                var fed = false
+                conv.convert(to: out, error: nil) { _, status in
+                    if fed { status.pointee = .noDataNow; return nil }
+                    fed = true; status.pointee = .haveData; return buffer
+                }
+                if out.frameLength > 0, let ch = out.int16ChannelData?[0] {
+                    let bytes = Data(bytes: ch, count: Int(out.frameLength) * 2)
+                    self.lock.lock(); self.pcm.append(bytes); self.lock.unlock()
+                }
             }
         }
-        return Armed(engine: engine, converter: conv, inFormat: inFormat,
-                     deviceID: Self.defaultInputDeviceID())
+        return firstConv
+    }
+
+    /// Runs AVAudioEngine calls that may raise Objective-C exceptions and turns
+    /// those into Swift errors instead of an abort().
+    static func objc(_ what: String, _ body: () throws -> Void) throws {
+        var swiftError: Error?
+        var nsError: NSError?
+        let ok = MFTryObjC({
+            do { try body() } catch { swiftError = error }
+        }, &nsError)
+        if let swiftError { throw swiftError }
+        if !ok {
+            let msg = nsError?.localizedDescription ?? "unknown exception"
+            mflog("\(what) raised: \(msg)")
+            throw MicError.engineFailed(msg)
+        }
     }
 
     // MARK: - Mid-recording recovery
@@ -262,24 +318,50 @@ final class AudioRecorder {
     /// and keep every byte captured so far. This is what turns the old
     /// "Microphone captured no audio" dead end into a ~200 ms hiccup.
     private func restartCapture(reason: String) {
-        guard isRecording, restarts < 5,
-              Date().timeIntervalSince(lastRestartAt) > 0.25 else { return }
+        guard isRecording, restarts < 8,
+              Date().timeIntervalSince(lastRestartAt) > 0.4 else { return }
         restarts += 1
         lastRestartAt = Date()
         mflog("mic restart #\(restarts) (\(reason)) — keeping \(capturedBytes) bytes")
 
+        // NOTE: pcm is deliberately NOT cleared — audio already captured stays.
+        // Restart IN PLACE on the same engine. Building a new engine and
+        // releasing the old one makes a Bluetooth headset see the mic close,
+        // and it flips back to music mode (48 kHz) — the old 24k/48k flapping
+        // that captured nothing.
         if let e = engine {
-            e.inputNode.removeTap(onBus: 0)
-            if e.isRunning { e.stop() }
-            e.reset()
+            do {
+                let input = e.inputNode
+                let fmt = input.outputFormat(forBus: 0)
+                guard fmt.sampleRate > 0, fmt.channelCount > 0 else { throw MicError.noInputDevice }
+                try Self.objc("restart in place") {
+                    input.removeTap(onBus: 0)
+                    if e.isRunning { e.stop() }
+                }
+                converter = try installCaptureTap(on: input, format: fmt)
+                try Self.objc("restart start") {
+                    e.prepare()
+                    try e.start()
+                }
+                mflog(String(format: "mic restarted in place at %.0f Hz", fmt.sampleRate))
+                return
+            } catch {
+                mflog("in-place restart failed (\(error.localizedDescription)) — rebuilding engine")
+                try? Self.objc("restart teardown") {
+                    e.inputNode.removeTap(onBus: 0)
+                    if e.isRunning { e.stop() }
+                    e.reset()
+                }
+            }
         }
         engine = nil
         converter = nil
-        // NOTE: pcm is deliberately NOT cleared — audio already captured stays.
         do {
             let built = try buildGraph()
-            built.engine.prepare()
-            try built.engine.start()
+            try Self.objc("restart start") {
+                built.engine.prepare()
+                try built.engine.start()
+            }
             engine = built.engine
             converter = built.converter
             mflog(String(format: "mic restarted at %.0f Hz", built.inFormat.sampleRate))
@@ -294,7 +376,9 @@ final class AudioRecorder {
         healthTimer?.invalidate()
         let t = Timer(timeInterval: 0.2, repeats: true) { [weak self] _ in
             guard let self, self.isRecording else { return }
-            if self.engine?.isRunning != true {
+            // A route change is still in flight — its own handler restarts.
+            if self.engine?.isRunning != true,
+               Date().timeIntervalSince(self.lastConfigChangeAt) > 0.35 {
                 self.restartCapture(reason: "engine stopped itself")
             }
         }
@@ -337,7 +421,7 @@ final class AudioRecorder {
         // Fast path: the graph was built before the key was pressed.
         if let a = takeArmed() {
             do {
-                try a.engine.start()
+                try Self.objc("start") { try a.engine.start() }
                 engine = a.engine
                 converter = a.converter
                 isRecording = true
@@ -353,9 +437,11 @@ final class AudioRecorder {
 
         // Cold path: build and start in one go (~140 ms).
         let built = try buildGraph()
-        built.engine.prepare()
         do {
-            try built.engine.start()
+            try Self.objc("cold start") {
+                built.engine.prepare()
+                try built.engine.start()
+            }
         } catch {
             built.dispose()
             throw MicError.engineFailed(error.localizedDescription)
@@ -401,9 +487,11 @@ final class AudioRecorder {
         healthTimer?.invalidate()
         healthTimer = nil
         if let engine {
-            engine.inputNode.removeTap(onBus: 0)
-            if engine.isRunning { engine.stop() }
-            engine.reset()
+            try? Self.objc("teardown") {
+                engine.inputNode.removeTap(onBus: 0)
+                if engine.isRunning { engine.stop() }
+                engine.reset()
+            }
         }
         engine = nil
         converter = nil

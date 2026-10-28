@@ -57,6 +57,42 @@ enum AudioDevices {
         return id
     }
 
+    private static func transportType(_ id: AudioDeviceID) -> UInt32 {
+        var addr = address(kAudioDevicePropertyTransportType)
+        var v: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &v) == noErr else { return 0 }
+        return v
+    }
+
+    static func isBluetooth(_ id: AudioDeviceID) -> Bool {
+        let t = transportType(id)
+        return t == kAudioDeviceTransportTypeBluetooth || t == kAudioDeviceTransportTypeBluetoothLE
+    }
+
+    /// The Mac's own microphone, if it has one.
+    static func builtInInputID() -> AudioDeviceID? {
+        var addr = address(kAudioHardwarePropertyDevices)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size) == noErr,
+              size > 0 else { return nil }
+        var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &ids) == noErr
+        else { return nil }
+        return ids.first { transportType($0) == kAudioDeviceTransportTypeBuiltIn && hasInput($0) && !isHidden($0) }
+    }
+
+    /// The device My Flow actually records from. A Bluetooth headset used as a
+    /// mic drops from A2DP (music) to HFP (call) mode: playback turns to mush,
+    /// the switch takes ~0.5-1 s, and AVAudioEngine stops itself mid-switch.
+    /// Users who sit at the Mac can opt to use the built-in mic instead.
+    static func captureInputID() -> AudioDeviceID {
+        let def = defaultInputID()
+        guard def != 0, AppSettings.shared.preferBuiltInMic, isBluetooth(def),
+              let builtIn = builtInInputID() else { return def }
+        return builtIn
+    }
+
     static func setDefaultInput(_ id: AudioDeviceID) {
         var addr = address(kAudioHardwarePropertyDefaultInputDevice)
         var dev = id

@@ -51,6 +51,10 @@ final class AppSettings: ObservableObject {
     @AppStorage("llmModel") var llmModel = "moonshotai/kimi-k3"
     @AppStorage("cleanupModel") var cleanupModel = "meta-llama/llama-3.3-70b-instruct"
     @AppStorage("muteWhileRecording") var muteWhileRecording = true
+    /// Opt-in: record from the Mac's mic when the system input is a Bluetooth
+    /// headset (AirPods). Off by default — the AirPods mic works away from the
+    /// Mac. See AudioDevices.captureInputID().
+    @AppStorage("useMacMicWithBluetooth") var preferBuiltInMic = false
     @AppStorage("vaultPath") var vaultPath = ""
     @AppStorage("asrFallbackModel") var asrFallbackModel = "openai/whisper-large-v3"
     @AppStorage("showFlowBar") var showFlowBar = true

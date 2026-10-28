@@ -34,6 +34,7 @@ final class Engine: ObservableObject {
     private var lastPasted = ""
     private var fieldReadTask: Task<Void, Never>?
     private var audioWatchdog: Task<Void, Never>?
+    private var pendingDuck: Task<Void, Never>?
     private var lastCancelledAudio: String?
 
     nonisolated init() {}
@@ -110,7 +111,7 @@ final class Engine: ObservableObject {
         if recorder.isRecording && !recorder.isHealthy {
             mflog("engine: recorder wedged — resetting before new recording")
             recorder.forceReset()
-            AudioDucking.unduck()
+            unduck()
         }
         return !recorder.isRecording
     }
@@ -134,7 +135,7 @@ final class Engine: ObservableObject {
                 }
             }
             try recorder.start()
-            AudioDucking.duck()   // silence background media while the mic is live
+            duckWhenMicSettles()  // silence background media while the mic is live
             if newPhase == .ptt { Sounds.play("Tink") }
             startAudioWatchdog()
         } catch {
@@ -143,6 +144,27 @@ final class Engine: ObservableObject {
             phase = .error(error.localizedDescription)
             scheduleIdle(after: 5)
         }
+    }
+
+    /// Muting the output of a Bluetooth headset while it is still switching
+    /// from music to mic mode can bounce it back to music mode, killing the
+    /// recording. So for Bluetooth, wait out the ~1 s switch before ducking.
+    private func duckWhenMicSettles() {
+        pendingDuck?.cancel()
+        guard AudioDevices.isBluetooth(AudioDevices.captureInputID()) else {
+            AudioDucking.duck(); return
+        }
+        pendingDuck = Task {
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            guard !Task.isCancelled, self.recorder.isRecording else { return }
+            AudioDucking.duck()
+        }
+    }
+
+    private func unduck() {
+        pendingDuck?.cancel()
+        pendingDuck = nil
+        AudioDucking.unduck()
     }
 
     /// If no audio arrives, the mic is dead — say so loudly instead of letting
@@ -170,7 +192,7 @@ final class Engine: ObservableObject {
             mflog("MIC DEAD: no audio 4s after start (restarts=\(self.recorder.restarts)) — aborting")
             self.micWarming = false
             self.recorder.forceReset()
-            AudioDucking.unduck()
+            unduck()
             Sounds.play("Basso")
             self.resetLevels()
             self.phase = .error(MicError.silentInput.localizedDescription)
@@ -186,7 +208,7 @@ final class Engine: ObservableObject {
         audioWatchdog?.cancel()
         let mode = phase
         let salvaged = recorder.cancel()
-        AudioDucking.unduck()
+        unduck()
         resetLevels()
 
         guard let (wav, duration) = salvaged else {
@@ -234,7 +256,7 @@ final class Engine: ObservableObject {
         audioWatchdog?.cancel()
         let bytesCaptured = recorder.capturedBytes
         guard let (wav, duration) = recorder.stop() else {
-            AudioDucking.unduck(); resetLevels()
+            unduck(); resetLevels()
             if bytesCaptured == 0 {
                 Sounds.play("Basso")
                 mflog("stop: zero bytes captured — reporting dead mic")
@@ -245,7 +267,7 @@ final class Engine: ObservableObject {
             }
             return
         }
-        AudioDucking.unduck()   // restore audio the moment the mic closes
+        unduck()   // restore audio the moment the mic closes
         Sounds.play("Pop")
         resetLevels()
         let isAI = (mode == .ai)
